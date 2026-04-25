@@ -84,22 +84,22 @@ async def analyze_relationship(
         matches = []
 
         for row1 in reader1:
-        drug_name = row1.get("drugName")
-        if not drug_name:
-            continue
-
-        for proxy_key, proxy_value in mapping.items():
-            if proxy_key in drug_name:  # substring match
-
-                for key2, rows in file2_index.items():
-                    if proxy_value in key2:  # substring match
-
-                        for row2 in rows:
-                            matches.append({
-                                "hospital": row1,
-                                "pharmacy": row2,
-                                "matched_on": f"{proxy_key} -> {proxy_value}"
-                            })
+            drug_name = row1.get("drugName")
+            if not drug_name:
+                continue
+    
+            for proxy_key, proxy_value in mapping.items():
+                if proxy_key in drug_name:  # substring match
+    
+                    for key2, rows in file2_index.items():
+                        if proxy_value in key2:  # substring match
+    
+                            for row2 in rows:
+                                matches.append({
+                                    "hospital": row1,
+                                    "pharmacy": row2,
+                                    "matched_on": f"{proxy_key} -> {proxy_value}"
+                                })
                             
         # 7. Return result
         return JSONResponse(content={
