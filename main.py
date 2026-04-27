@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from typing import Optional
 import logging
 import numpy as np
+import pandas as pd
 
 logging.basicConfig(
     level=logging.INFO,
@@ -137,9 +138,7 @@ async def analyze(drugName: Optional[str] = None):
         logger.info(f"FINAL QUERY:\n{query}")
 
         result = con.execute(query, params).fetchdf()
-
-        # Fix NaN → None (JSON safe)
-        result = result.where(result.notna(), None)
+        result = result.astype(object).where(pd.notna(result), None)
 
         logger.info(f"Matches found: {len(result)}")
 
