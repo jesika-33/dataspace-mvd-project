@@ -95,6 +95,7 @@ async def analyze(drugName: Optional[str] = None):
             ON lower(h.drugName) LIKE '%' || lower(p."Hospital") || '%'
         JOIN read_csv_auto('{pharma_path}', delim=',') ph
             ON lower(ph.NAME) LIKE '%' || lower(p."Pharma_company (MID)") || '%'
+        LIMIT 200
         """
 
         if drugName:
