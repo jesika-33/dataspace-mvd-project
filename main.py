@@ -86,7 +86,7 @@ async def analyze(drugName: Optional[str] = None):
 
         con = duckdb.connect()
 
-        # Base join query
+        # Base query (NO LIMIT here)
         base_query = f"""
         SELECT
             h.*,
@@ -107,19 +107,25 @@ async def analyze(drugName: Optional[str] = None):
             strict_mode=false
         ) ph
             ON lower(ph.NAME) LIKE '%' || lower(p."Pharma_company (MID)") || '%'
-        LIMIT 100
         """
 
+        # Build final query safely
         if drugName:
-            query = base_query + " WHERE lower(h.drugName) LIKE '%' || ? || '%'"
-            result = con.execute(query, [drugName.lower()]).fetchdf()
+            query = base_query + "\nWHERE lower(h.drugName) LIKE ?\nLIMIT 100"
+            params = [f"%{drugName.lower()}%"]
         else:
-            result = con.execute(base_query).fetchdf()
+            query = base_query + "\nLIMIT 100"
+            params = []
 
-        # Convert NaN/None to proper None for JSON serialization
-        result = result.replace({np.nan: None})
+        logger.info(f"FINAL QUERY:\n{query}")
+
+        result = con.execute(query, params).fetchdf()
+
+        # Fix NaN → None (JSON safe)
+        result = result.where(result.notna(), None)
 
         logger.info(f"Matches found: {len(result)}")
+
         return JSONResponse(content={
             "status": "success",
             "drugName_filter": drugName,
