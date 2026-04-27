@@ -132,7 +132,7 @@ async def analyze(drugName: Optional[str] = None):
             query = base_query + "\nWHERE lower(h.drugName) LIKE ?\nLIMIT 100"
             params = [f"%{drugName.lower()}%"]
         else:
-            query = base_query + "\nLIMIT 50"
+            query = base_query + "\nLIMIT 10"
             params = []
 
         logger.info(f"FINAL QUERY:\n{query}")
