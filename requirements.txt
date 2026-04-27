@@ -1,4 +1,7 @@
+duckdb
 fastapi
 uvicorn
 httpx
 python-multipart
+numpy
+pandas

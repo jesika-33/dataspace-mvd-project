@@ -1,10 +1,9 @@
 import os
-import csv
-import io
+import duckdb
 import httpx
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import tempfile
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from typing import Dict
 import logging
 
 logging.basicConfig(
@@ -13,88 +12,57 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="CSV Proxy Join Service", version="1.0")
+app = FastAPI(title="CSV Proxy Join Service (DuckDB)", version="3.0")
 
-# Configuration
 PROXY_TABLE_URL = os.getenv(
     "PROXY_TABLE_URL",
     "https://pub-d6fe39b08661488e81a2159f5c153c29.r2.dev/drugsComTrain_raw.csv"
 )
 
-# ---------------------------
-# NORMALIZATION (single source of truth)
-# ---------------------------
-def normalize(value: str) -> str:
-    if value is None:
-        return ""
-    return value.strip().lower()
+HOSPITAL_URL = os.getenv(
+    "ANONYMIZED_HOSPITAL_TABLE_URL",
+    "https://pub-d6fe39b08661488e81a2159f5c153c29.r2.dev/data_spaces-anonymized.csv"
+)
+
+PHARMA_URL = os.getenv(
+    "PHARMA_TABLE_URL",
+    "https://pub-d6fe39b08661488e81a2159f5c153c29.r2.dev/2_MID.csv"
+)
 
 
 # ---------------------------
-# STREAM CSV (memory-safe)
+# DOWNLOAD FILE (STREAM SAFE)
 # ---------------------------
-def stream_csv(file, delimiter):
-    file.seek(0)
+async def download_file(url: str, max_retries: int = 3) -> str:
+    filename = url.split("/")[-1]
+    filepath = f"/tmp/{filename}"
 
-    reader = csv.DictReader(
-        (line.decode("utf-8", errors="ignore") for line in file),
-        delimiter=delimiter
-    )
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Downloading (attempt {attempt+1}): {url}")
 
-    # Clean headers
-    if reader.fieldnames:
-        reader.fieldnames = [
-            f.strip().replace('\ufeff', '') for f in reader.fieldnames
-        ]
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", url) as resp:
+                    resp.raise_for_status()
 
-    # Normalize each row
-    for row in reader:
-        yield {k: normalize(v) for k, v in row.items()}
+                    with open(filepath, "wb") as f:
+                        async for chunk in resp.aiter_bytes():
+                            f.write(chunk)
 
+            logger.info(f"Download complete: {filepath}")
+            return filepath
 
-# ---------------------------
-# FETCH PROXY TABLE
-# ---------------------------
-async def fetch_proxy_table(url: str) -> Dict[str, str]:
-    logger.info(f"Fetching proxy table from: {url}")
-    mapping = {}
+        except Exception as e:
+            logger.warning(f"Download failed (attempt {attempt+1}): {e}")
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
+            if attempt == max_retries - 1:
+                raise
 
-        content = resp.text
-
-        reader = csv.DictReader(io.StringIO(content), delimiter=',')
-
-        # Clean headers
-        if reader.fieldnames:
-            reader.fieldnames = [
-                f.strip().replace('\ufeff', '') for f in reader.fieldnames
-            ]
-
-        for row in reader:
-            keys = list(row.keys())
-            if len(keys) >= 2:
-                k = normalize(row[keys[0]])
-                v = normalize(row[keys[1]])
-
-                if not k or not v:
-                    continue
-
-                mapping[k] = v
-
-    logger.info(f"Loaded {len(mapping)} proxy mappings")
-
-    # Debug sample
-    for i, (k, v) in enumerate(list(mapping.items())[:5]):
-        logger.info(f"Mapping sample {i}: '{k}' -> '{v}'")
-
-    return mapping
+    return filepath
 
 
 # ---------------------------
-# HEALTH CHECK
+# HEALTH
 # ---------------------------
 @app.get("/health")
 async def health():
@@ -102,121 +70,117 @@ async def health():
 
 
 # ---------------------------
-# MAIN ANALYZE ENDPOINT
+# MAIN ANALYZE
 # ---------------------------
-@app.post("/analyze")
-async def analyze_relationship(
-    file1: UploadFile = File(...),
-    file2: UploadFile = File(...)
-):
+@app.get("/analyze")
+async def analyze():
     try:
-        logger.info("==== NEW /analyze REQUEST ====")
-        logger.info(f"Received files: {file1.filename}, {file2.filename}")
+        logger.info("==== NEW ANALYSIS (DuckDB) ====")
 
-        if not (file1.filename.endswith('.csv') and file2.filename.endswith('.csv')):
-            raise HTTPException(status_code=400, detail="Both files must be CSV.")
+        # 1. Download files
+        hospital_path = await download_file(HOSPITAL_URL)
+        pharma_path = await download_file(PHARMA_URL)
+        proxy_path = await download_file(PROXY_TABLE_URL)
 
-        # 1. Load proxy mapping
-        mapping = await fetch_proxy_table(PROXY_TABLE_URL)
+        # 2. Connect DuckDB
+        con = duckdb.connect()
 
-        # 2. Build index for file2 (pharmacy)
-        logger.info("Indexing file2 (pharmacy)...")
-        file2_index = {}
+        # ---------------------------
+        # DEBUG 1: Sample hospital drugName
+        # ---------------------------
+        logger.info("Sampling hospital drugName...")
+        df_drugs = con.execute(f"""
+            SELECT DISTINCT drugName
+            FROM read_csv_auto('{hospital_path}')
+            WHERE drugName IS NOT NULL
+            LIMIT 20
+        """).fetchdf()
 
-        reader2 = stream_csv(file2.file, delimiter=';')
+        logger.info(f"Sample drugName:\n{df_drugs}")
 
-        # Need fieldnames separately (DictReader quirk)
-        file2.file.seek(0)
-        raw_reader2 = csv.DictReader(
-            (line.decode("utf-8", errors="ignore") for line in file2.file),
-            delimiter=';'
-        )
-        headers2 = [
-            f.strip().replace('\ufeff', '') for f in raw_reader2.fieldnames
-        ]
+        # ---------------------------
+        # DEBUG 2: Sample pharma NAME
+        # ---------------------------
+        logger.info("Sampling pharma NAME...")
+        df_pharma = con.execute(f"""
+            SELECT DISTINCT NAME
+            FROM read_csv_auto('{pharma_path}', delim=',')
+            WHERE NAME IS NOT NULL
+            LIMIT 20
+        """).fetchdf()
 
-        logger.info(f"File2 columns: {headers2}")
+        logger.info(f"Sample NAME:\n{df_pharma}")
 
-        if "NAME" not in headers2:
-            raise HTTPException(status_code=400, detail="file2 must contain column 'NAME'")
+        # ---------------------------
+        # DEBUG 3: Check proxy mapping
+        # ---------------------------
+        logger.info("Sampling proxy mapping...")
+        df_proxy = con.execute(f"""
+            SELECT *
+            FROM read_csv_auto('{proxy_path}')
+            LIMIT 10
+        """).fetchdf()
 
-        for i, row in enumerate(reader2):
-            key = row.get("NAME")
-            if key:
-                file2_index.setdefault(key, []).append(row)
+        logger.info(f"Proxy sample:\n{df_proxy}")
 
-            if i > 0 and i % 20000 == 0:
-                logger.info(f"Indexed {i} rows from file2")
+        # ---------------------------
+        # DEBUG 4: Check partial matches (hospital ↔ proxy)
+        # ---------------------------
+        logger.info("Checking hospital ↔ proxy matches...")
+        df_hp = con.execute(f"""
+            SELECT h.drugName, p."Hospital"
+            FROM read_csv_auto('{hospital_path}') h
+            JOIN read_csv_auto('{proxy_path}') p
+            ON lower(h.drugName) LIKE '%' || lower(p."Hospital") || '%'
+            LIMIT 20
+        """).fetchdf()
 
-        logger.info(f"Finished indexing file2: {len(file2_index)} unique keys")
-        logger.info(f"Sample file2 keys: {list(file2_index.keys())[:20]}")
+        logger.info(f"Hospital ↔ Proxy matches:\n{df_hp}")
 
-        # 3. Process file1
-        logger.info("Processing file1 (hospital)...")
-        matches = []
+        # ---------------------------
+        # DEBUG 5: Check proxy ↔ pharma matches
+        # ---------------------------
+        logger.info("Checking proxy ↔ pharma matches...")
+        df_pp = con.execute(f"""
+            SELECT ph.NAME, p."Pharma_company (MID)"
+            FROM read_csv_auto('{pharma_path}', delim=',') ph
+            JOIN read_csv_auto('{proxy_path}') p
+            ON lower(ph.NAME) LIKE '%' || lower(p."Pharma_company (MID)") || '%'
+            LIMIT 20
+        """).fetchdf()
 
-        reader1 = stream_csv(file1.file, delimiter=',')
+        logger.info(f"Proxy ↔ Pharma matches:\n{df_pp}")
 
-        # Same trick to read headers
-        file1.file.seek(0)
-        raw_reader1 = csv.DictReader(
-            (line.decode("utf-8", errors="ignore") for line in file1.file),
-            delimiter=','
-        )
-        headers1 = [
-            f.strip().replace('\ufeff', '') for f in raw_reader1.fieldnames
-        ]
+        # ---------------------------
+        # MAIN JOIN
+        # ---------------------------
+        logger.info("Running FULL join...")
 
-        logger.info(f"File1 columns: {headers1}")
+        query = f"""
+        SELECT
+            h.drugName,
+            ph.NAME,
+            p."Hospital",
+            p."Pharma_company (MID)"
+        FROM read_csv_auto('{hospital_path}') h
+        JOIN read_csv_auto('{proxy_path}') p
+            ON lower(h.drugName) LIKE '%' || lower(p."Hospital") || '%'
+        JOIN read_csv_auto('{pharma_path}', delim=',') ph
+            ON lower(ph.NAME) LIKE '%' || lower(p."Pharma_company (MID)") || '%'
+        LIMIT 50
+        """
 
-        if "drugName" not in headers1:
-            raise HTTPException(status_code=400, detail="file1 must contain column 'drugName'")
+        result = con.execute(query).fetchdf()
 
-        sample_drugs = set()
-
-        for i, row1 in enumerate(reader1):
-            drug_name = row1.get("drugName")
-            if not drug_name:
-                continue
-
-            if len(sample_drugs) < 20:
-                sample_drugs.add(drug_name)
-
-            for proxy_key, proxy_value in mapping.items():
-                if proxy_key in drug_name:
-                    for key2, rows in file2_index.items():
-                        if proxy_value in key2:
-                            for row2 in rows:
-                                matches.append({
-                                    "hospital": row1,
-                                    "pharmacy": row2,
-                                    "matched_on": f"{proxy_key} -> {proxy_value} (partial)"
-                                })
-
-            if i > 0 and i % 20000 == 0:
-                logger.info(f"Processed {i} rows, matches: {len(matches)}")
-
-            if len(matches) >= 50:
-                break
-
-        logger.info(f"Sample drugNames: {list(sample_drugs)}")
-        logger.info(f"Final matches: {len(matches)}")
-
-        # Log first matches clearly
-        for i, match in enumerate(matches[:10]):
-            logger.info(
-                f"Match {i}: {match['hospital'].get('drugName')} "
-                f"→ {match['pharmacy'].get('NAME')} "
-                f"via {match['matched_on']}"
-            )
+        logger.info(f"Final matches found: {len(result)}")
+        logger.info(f"Match sample:\n{result.head(10)}")
 
         return JSONResponse(content={
             "status": "success",
-            "matches_found": len(matches),
-            "matches": matches[:50],
-            "note": "Normalized + streaming join"
+            "rows": result.to_dict(orient="records"),
+            "count": len(result)
         })
 
     except Exception as e:
-        logger.exception("Error during join")
+        logger.exception("Error in DuckDB processing")
         raise HTTPException(status_code=500, detail=str(e))
