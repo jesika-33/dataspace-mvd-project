@@ -158,16 +158,13 @@ async def analyze():
 
         query = f"""
         SELECT
-            h.drugName,
-            ph.NAME,
-            p."Hospital",
-            p."Pharma_company (MID)"
+            h.*,
+            ph.*
         FROM read_csv_auto('{hospital_path}') h
         JOIN read_csv_auto('{proxy_path}') p
             ON lower(h.drugName) LIKE '%' || lower(p."Hospital") || '%'
         JOIN read_csv_auto('{pharma_path}', delim=',') ph
             ON lower(ph.NAME) LIKE '%' || lower(p."Pharma_company (MID)") || '%'
-        LIMIT 50
         """
 
         result = con.execute(query).fetchdf()
