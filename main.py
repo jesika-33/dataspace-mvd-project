@@ -4,6 +4,7 @@ import httpx
 import tempfile
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from typing import Optional
 import logging
 
 logging.basicConfig(
@@ -73,90 +74,19 @@ async def health():
 # MAIN ANALYZE
 # ---------------------------
 @app.get("/analyze")
-async def analyze():
+async def analyze(drugName: Optional[str] = None):
     try:
-        logger.info("==== NEW ANALYSIS (DuckDB) ====")
+        logger.info(f"==== NEW ANALYSIS (DuckDB) with drugName={drugName} ====")
 
-        # 1. Download files
+        # Download files
         hospital_path = await download_file(HOSPITAL_URL)
         pharma_path = await download_file(PHARMA_URL)
         proxy_path = await download_file(PROXY_TABLE_URL)
 
-        # 2. Connect DuckDB
         con = duckdb.connect()
 
-        # ---------------------------
-        # DEBUG 1: Sample hospital drugName
-        # ---------------------------
-        logger.info("Sampling hospital drugName...")
-        df_drugs = con.execute(f"""
-            SELECT DISTINCT drugName
-            FROM read_csv_auto('{hospital_path}')
-            WHERE drugName IS NOT NULL
-            LIMIT 20
-        """).fetchdf()
-
-        logger.info(f"Sample drugName:\n{df_drugs}")
-
-        # ---------------------------
-        # DEBUG 2: Sample pharma NAME
-        # ---------------------------
-        logger.info("Sampling pharma NAME...")
-        df_pharma = con.execute(f"""
-            SELECT DISTINCT NAME
-            FROM read_csv_auto('{pharma_path}', delim=',')
-            WHERE NAME IS NOT NULL
-            LIMIT 20
-        """).fetchdf()
-
-        logger.info(f"Sample NAME:\n{df_pharma}")
-
-        # ---------------------------
-        # DEBUG 3: Check proxy mapping
-        # ---------------------------
-        logger.info("Sampling proxy mapping...")
-        df_proxy = con.execute(f"""
-            SELECT *
-            FROM read_csv_auto('{proxy_path}')
-            LIMIT 10
-        """).fetchdf()
-
-        logger.info(f"Proxy sample:\n{df_proxy}")
-
-        # ---------------------------
-        # DEBUG 4: Check partial matches (hospital ↔ proxy)
-        # ---------------------------
-        logger.info("Checking hospital ↔ proxy matches...")
-        df_hp = con.execute(f"""
-            SELECT h.drugName, p."Hospital"
-            FROM read_csv_auto('{hospital_path}') h
-            JOIN read_csv_auto('{proxy_path}') p
-            ON lower(h.drugName) LIKE '%' || lower(p."Hospital") || '%'
-            LIMIT 20
-        """).fetchdf()
-
-        logger.info(f"Hospital ↔ Proxy matches:\n{df_hp}")
-
-        # ---------------------------
-        # DEBUG 5: Check proxy ↔ pharma matches
-        # ---------------------------
-        logger.info("Checking proxy ↔ pharma matches...")
-        df_pp = con.execute(f"""
-            SELECT ph.NAME, p."Pharma_company (MID)"
-            FROM read_csv_auto('{pharma_path}', delim=',') ph
-            JOIN read_csv_auto('{proxy_path}') p
-            ON lower(ph.NAME) LIKE '%' || lower(p."Pharma_company (MID)") || '%'
-            LIMIT 20
-        """).fetchdf()
-
-        logger.info(f"Proxy ↔ Pharma matches:\n{df_pp}")
-
-        # ---------------------------
-        # MAIN JOIN
-        # ---------------------------
-        logger.info("Running FULL join...")
-
-        query = f"""
+        # Base join query
+        base_query = f"""
         SELECT
             h.*,
             ph.*
@@ -167,17 +97,21 @@ async def analyze():
             ON lower(ph.NAME) LIKE '%' || lower(p."Pharma_company (MID)") || '%'
         """
 
-        result = con.execute(query).fetchdf()
+        if drugName:
+            query = base_query + " WHERE lower(h.drugName) LIKE '%' || ? || '%'"
+            result = con.execute(query, [drugName.lower()]).fetchdf()
+        else:
+            result = con.execute(base_query).fetchdf()
 
-        logger.info(f"Final matches found: {len(result)}")
-        logger.info(f"Match sample:\n{result.head(10)}")
-
+        # Convert NaN/None to proper None for JSON serialization
         result = result.where(result.notna(), None)
 
+        logger.info(f"Matches found: {len(result)}")
         return JSONResponse(content={
             "status": "success",
-            "rows": result.to_dict(orient="records"),
-            "count": len(result)
+            "drugName_filter": drugName,
+            "count": len(result),
+            "rows": result.to_dict(orient="records")
         })
 
     except Exception as e:
