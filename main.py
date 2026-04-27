@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from typing import Optional
 import logging
+import numpy as np
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,9 +94,19 @@ async def analyze(drugName: Optional[str] = None):
         FROM read_csv_auto('{hospital_path}') h
         JOIN read_csv_auto('{proxy_path}') p
             ON lower(h.drugName) LIKE '%' || lower(p."Hospital") || '%'
-        JOIN read_csv_auto('{pharma_path}', delim=',') ph
+        JOIN read_csv_auto(
+            '{pharma_path}',
+            delim=',',
+            quote='"',
+            escape='"',
+            header=True,
+            ignore_errors=True,
+            null_padding=True,
+            sample_size=-1,
+            parallel=false
+        ) ph
             ON lower(ph.NAME) LIKE '%' || lower(p."Pharma_company (MID)") || '%'
-        LIMIT 200
+        LIMIT 100
         """
 
         if drugName:
@@ -105,7 +116,7 @@ async def analyze(drugName: Optional[str] = None):
             result = con.execute(base_query).fetchdf()
 
         # Convert NaN/None to proper None for JSON serialization
-        result = result.where(result.notna(), None)
+        result = result.replace({np.nan: None})
 
         logger.info(f"Matches found: {len(result)}")
         return JSONResponse(content={
